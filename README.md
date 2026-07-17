@@ -66,6 +66,16 @@ effect on the result.
 - Input must be a single-band GeoTIFF. The output is always written as a
   tiled, Deflate-compressed `Float32` GeoTIFF preserving the input's
   geo-transform, EPSG code, and `nodata` value.
+- **Input must not use a TIFF predictor** (tag 317). `wbgeotiff` does not
+  implement predictors: it inflates the compressed stream and returns the bytes
+  verbatim, so `PREDICTOR=2`/`3` data would decode as garbage (`±Inf` /
+  `f32::MAX`) with no error raised. The tool detects this and refuses to run.
+  GDAL writes `PREDICTOR=3` routinely for float rasters — it compresses to
+  roughly 1.7x versus 1.1x without — so this is easy to hit. Re-encode first:
+
+  ```bash
+  gdal_translate -co COMPRESS=DEFLATE -co PREDICTOR=1 predictor3.tif stripped.tif
+  ```
 - The first two stages (normal computation, normal smoothing) are parallelised
   with [`rayon`](https://crates.io/crates/rayon). The elevation-update stage is
   intentionally sequential (Gauss-Seidel style) to match the upstream

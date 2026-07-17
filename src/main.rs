@@ -1,10 +1,16 @@
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::BufReader;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use rayon::prelude::*;
+use wbgeotiff::ifd::TiffReader;
 use wbgeotiff::{Compression, GeoTiff, GeoTiffWriter, SampleFormat, WriteLayout};
+
+/// TIFF tag 317 (Predictor).
+const TAG_PREDICTOR: u16 = 317;
 
 /// Reduce short-scale variation in a DEM using a modified
 /// Sun et al. (2007) feature-preserving smoothing algorithm.
@@ -62,6 +68,56 @@ impl Normal {
     }
 }
 
+/// Refuse input that uses a TIFF predictor.
+///
+/// `wbgeotiff` does not implement the Predictor tag (317) at all: it inflates the
+/// compressed stream and returns the bytes verbatim. For PREDICTOR=2 (horizontal)
+/// or 3 (floating-point) those bytes are still per-row deltas, so they decode as
+/// garbage — a Float32 DEM comes back full of `-Inf` / `f32::MAX` — and nothing
+/// reports an error, because `read_band_f32` happily reinterprets them.
+///
+/// A silently corrupt DEM is far worse than a failed run, so bail out with a
+/// message that names the fix. GDAL writes PREDICTOR=3 routinely for float rasters
+/// (it compresses ~1.7x vs ~1.1x), so this is easy to hit by accident.
+fn reject_predictor(path: &Path) -> Result<()> {
+    let file = File::open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    let mut reader = TiffReader::new(BufReader::new(file))
+        .with_context(|| format!("failed to parse TIFF header of {}", path.display()))?;
+    let ifds = reader
+        .read_all_ifds()
+        .with_context(|| format!("failed to read IFDs of {}", path.display()))?;
+    let Some(ifd) = ifds.first() else {
+        bail!("{} contains no IFD", path.display());
+    };
+
+    // Absent tag means predictor 1 (none), which is what we want.
+    let predictor = ifd
+        .get(TAG_PREDICTOR)
+        .and_then(|e| e.value.as_u64())
+        .unwrap_or(1);
+
+    if predictor != 1 {
+        let kind = match predictor {
+            2 => "2 (horizontal differencing)",
+            3 => "3 (floating-point differencing)",
+            _ => "unknown",
+        };
+        bail!(
+            "{} uses TIFF predictor {}, which this tool cannot decode \
+             (its wbgeotiff I/O layer ignores tag 317 and would silently produce \
+             an ±Inf / f32::MAX raster).\n\
+             Re-encode without a predictor first, e.g.:\n  \
+             gdal_translate -co COMPRESS=DEFLATE -co PREDICTOR=1 {} stripped.tif",
+            path.display(),
+            kind,
+            path.display()
+        );
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -77,6 +133,8 @@ fn main() -> Result<()> {
 
     println!("Reading {}", args.input.display());
     let start = Instant::now();
+
+    reject_predictor(&args.input)?;
 
     let tiff = GeoTiff::open(&args.input)
         .with_context(|| format!("failed to open {}", args.input.display()))?;
